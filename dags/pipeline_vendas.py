@@ -389,7 +389,7 @@ with DAG(
     default_args=default_args,
     description='Pipeline ETL de Vendas com Geolocalização '
                 '(PostgreSQL → Redshift → Parquet/HDFS → PostgreSQL Data Mart)',
-    schedule_interval='@daily',
+    schedule='@daily',
     start_date=datetime(2023, 1, 1),
     catchup=False,
     tags=['vendas', 'etl', 'idempotente', 'geolocalizacao'],
