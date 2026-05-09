@@ -12,7 +12,6 @@ from datetime import datetime, timedelta
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.utils.dates import days_ago
 
 import pandas as pd
 from sqlalchemy import create_engine, text
@@ -391,7 +390,7 @@ with DAG(
     description='Pipeline ETL de Vendas com Geolocalização '
                 '(PostgreSQL → Redshift → Parquet/HDFS → PostgreSQL Data Mart)',
     schedule_interval='@daily',
-    start_date=days_ago(1),
+    start_date=datetime(2023, 1, 1),
     catchup=False,
     tags=['vendas', 'etl', 'idempotente', 'geolocalizacao'],
 ) as dag:
