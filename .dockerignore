@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+
+projeto/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+lake/
+*.parquet
+.git/
+.gitignore

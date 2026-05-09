@@ -1,0 +1,39 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+projeto/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local data/output artifacts
+lake/
+*.parquet
+
+# Local planning documents
+PLANO_ACAO*.md
+plano_acao*.md
+
+# OS/editor noise
+.DS_Store
+.vscode/
+.idea/

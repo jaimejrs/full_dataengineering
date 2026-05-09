@@ -1,0 +1,13 @@
+name: painel-vendas
+
+services:
+  painel-vendas:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: painel-vendas
+    env_file:
+      - .env
+    ports:
+      - "${DASH_PORT:-8050}:${DASH_PORT:-8050}"
+    restart: unless-stopped
