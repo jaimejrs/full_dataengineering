@@ -24,21 +24,37 @@ from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 
 # ── Configuração ──────────────────────────────────────────────────────────────
-env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env')
-load_dotenv(dotenv_path=env_path)
+env_paths = [
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env'),
+    '/home/jota/digital_college/projeto_python14/projeto/.env'
+]
+
+for p in env_paths:
+    if os.path.exists(p):
+        load_dotenv(dotenv_path=p)
+        break
 
 log = logging.getLogger(__name__)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def get_source_engine():
-    return create_engine(os.environ.get("SOURCE_DATABASE_URL"))
+    url = os.environ.get("SOURCE_DATABASE_URL")
+    if not url:
+        raise ValueError("Variável SOURCE_DATABASE_URL não encontrada! Verifique se o arquivo .env foi carregado.")
+    return create_engine(url)
 
 def get_dw_engine():
-    return create_engine(os.environ.get("REDSHIFT_DATABASE_URL"))
+    url = os.environ.get("REDSHIFT_DATABASE_URL")
+    if not url:
+        raise ValueError("Variável REDSHIFT_DATABASE_URL não encontrada! Verifique se o arquivo .env foi carregado.")
+    return create_engine(url)
 
 def get_dm_engine():
-    return create_engine(os.environ.get("DASHBOARD_DATABASE_URL"))
+    url = os.environ.get("DASHBOARD_DATABASE_URL")
+    if not url:
+        raise ValueError("Variável DASHBOARD_DATABASE_URL não encontrada! Verifique se o arquivo .env foi carregado.")
+    return create_engine(url)
 
 def add_sk(df, col_name="sk"):
     """Adiciona surrogate key sequencial como primeira coluna."""
