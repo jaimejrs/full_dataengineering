@@ -1,13 +1,19 @@
-# 🚀 Pipeline de Dados — Digital Corporativo
+# Full Data Engineering
 
 > Pipeline ETL completo para análise de vendas com suporte a Pessoa Física e Jurídica, geolocalização por estado/cidade, orquestração via Airflow, Data Lake distribuído em HDFS e dashboard interativo.
 
 **Projeto:** DEM-BI-2024-014-EXT | Digital College  
-**Aluno:** Jaime Ribeiro
+**Aluno:** Jaime Teixeira
 
 ---
 
 ## 📸 Screenshots
+
+### Arquitetura do Pipeline
+![Arquitetura Infografico](docs/screenshots/00_arquitetura_infografico.jpg)
+
+### Dashboard Interativo (Dash/Plotly)
+![Dash Dashboard](docs/screenshots/06_dash_dashboard.png)
 
 ### Apache Airflow — DAG com todas as tasks em sucesso
 ![Airflow DAG Success](docs/screenshots/03_airflow_dag.png)
@@ -23,41 +29,6 @@
 
 ### Docker Desktop — Todos os containers em execução
 ![Docker Containers](docs/screenshots/04_docker_containers.png)
-
----
-
-## 🏗️ Arquitetura do Pipeline
-
-```
-┌─────────────────┐      ┌──────────────────┐      ┌─────────────────────┐
-│   PostgreSQL    │─────▶│  Amazon Redshift  │─────▶│   Apache HDFS       │
-│   (Banco Fonte) │      │  (Data Warehouse) │      │   (Data Lake)       │
-│  alwaysdata.com │      │  Star Schema      │      │  Parquet particionado│
-└─────────────────┘      └──────────────────┘      └─────────────────────┘
-         │                        │                          │
-         │                        ▼                          │
-         │               ┌──────────────────┐               │
-         │               │   PostgreSQL      │               │
-         │               │   (Data Mart)     │               │
-         │               │  Hostinger Cloud  │               │
-         │               └────────┬─────────┘               │
-         │                        │                          │
-         ▼                        ▼                          ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Apache Airflow                                   │
-│   DAG: pipeline_vendas_digital_corporativo  (schedule: @daily)          │
-│                                                                          │
-│  [extrair_banco_fonte] → [carregar_redshift] → [gravar_data_lake]       │
-│                        → [popular_data_mart] → [validar_pipeline]       │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-                         ┌──────────────────┐
-                         │  Dashboard Dash  │
-                         │  Plotly / Python │
-                         │  localhost:8050  │
-                         └──────────────────┘
-```
 
 ---
 
@@ -77,7 +48,7 @@
 
 ---
 
-## 📐 Modelo Dimensional (Star Schema)
+## Modelo Dimensional (Star Schema)
 
 ### Dimensões — Redshift
 
@@ -90,7 +61,7 @@
 | `dim_localidade` | Dimensão | Geolocalização completa (bairro, cidade, estado, CEP) |
 | `fato_venda` | Fato | Grão: 1 item de nota fiscal — ~342 mil linhas |
 
-> 💡 A `dim_cliente` foi refatorada para suportar tanto **Pessoa Física** (CPF) quanto **Pessoa Jurídica** (CNPJ), unificando via `COALESCE` nas tabelas `geral.pessoa_fisica` e `geral.pessoa_juridica`.
+> A `dim_cliente` foi refatorada para suportar tanto **Pessoa Física** (CPF) quanto **Pessoa Jurídica** (CNPJ), unificando via `COALESCE` nas tabelas `geral.pessoa_fisica` e `geral.pessoa_juridica`.
 
 ### Data Mart — PostgreSQL (Hostinger)
 
@@ -115,11 +86,13 @@ projeto/
 ├── .gitignore
 ├── docs/
 │   └── screenshots/         # Evidências do pipeline em execução
+│       ├── 00_arquitetura_infografico.jpg
 │       ├── 01_datamart_pgadmin.png
 │       ├── 02_hadoop_hdfs.png
 │       ├── 03_airflow_dag.png
 │       ├── 04_docker_containers.png
-│       └── 05_redshift_query.png
+│       ├── 05_redshift_query.png
+│       └── 06_dash_dashboard.png
 ├── dags/
 │   ├── pipeline_vendas.py   # DAG principal com 5 tasks (psycopg2 puro)
 │   └── etl_vendas_dag.py    # DAG base auxiliar
@@ -130,16 +103,9 @@ projeto/
 
 ---
 
-## ⚙️ Configuração e Execução
+## Configuração e Execução
 
-### 1. Clonar o repositório
-
-```bash
-git clone https://github.com/jaimejrs/full_dataengineering.git
-cd full_dataengineering
-```
-
-### 2. Variáveis de ambiente
+### 1. Variáveis de ambiente
 
 Copie o template e preencha com suas credenciais:
 
@@ -163,21 +129,7 @@ HDFS_USER=root
 HDFS_DEST_PATH=/vendas/fato_vendas/
 ```
 
-> ⚠️ **NUNCA** commite o arquivo `.env`. Ele está protegido no `.gitignore`.
-
-### 3. Subir os containers (Airflow + Hadoop + PostgreSQL)
-
-```bash
-docker compose up --build
-```
-
-| Serviço | URL |
-|---------|-----|
-| Airflow UI | http://localhost:8080 |
-| Dashboard | http://localhost:8050 |
-| Hadoop HDFS | http://localhost:9870 |
-
-### 4. Executar o pipeline manualmente
+### 2. Executar o pipeline manualmente
 
 1. Acesse o Airflow em http://localhost:8080
 2. Ative a DAG `pipeline_vendas_digital_corporativo`
@@ -186,7 +138,7 @@ docker compose up --build
 
 ---
 
-## 📊 Dashboard
+## Dashboard
 
 O painel analítico contém:
 
@@ -202,7 +154,7 @@ Filtro de **ano** atualiza todos os KPIs e gráficos simultaneamente.
 
 ---
 
-## 🔄 Design do Pipeline (DAG)
+## Design do Pipeline (DAG)
 
 ### Tasks e responsabilidades
 
@@ -229,20 +181,20 @@ def get_conn(url: str):
 
 ---
 
-## ✅ Validações Realizadas
+## Validações Realizadas
 
-- [x] Contagem de linhas em cada dimensão e tabela fato
-- [x] Nulos em surrogate keys zerados após backfill de PJ
-- [x] Conferência de totais entre Data Mart e Redshift
-- [x] Idempotência: re-execuções não duplicam dados
-- [x] Dashboard sem erros de callback com filtros
-- [x] Pipeline Airflow com todas as tasks `success`
-- [x] HDFS com arquivos `data_historico_atualizado.parquet` datados de 2026-05-10
-- [x] dim_cliente suportando PF e PJ com coluna `tipo_pessoa`
+- Contagem de linhas em cada dimensão e tabela fato
+- Nulos em surrogate keys zerados após backfill de PJ
+- Conferência de totais entre Data Mart e Redshift
+- Idempotência: re-execuções não duplicam dados
+- Dashboard sem erros de callback com filtros
+- Pipeline Airflow com todas as tasks `success`
+- HDFS com arquivos `data_historico_atualizado.parquet` datados de 2026-05-10
+- dim_cliente suportando PF e PJ com coluna `tipo_pessoa`
 
 ---
 
-## 🔐 Segurança
+## Segurança
 
 - `.env` nunca commitado (protegido por `.gitignore`)
 - `.env.example` disponível sem credenciais reais
@@ -251,6 +203,6 @@ def get_conn(url: str):
 
 ---
 
-## 📄 Licença
+## Licença
 
 Projeto acadêmico desenvolvido para o curso de Engenharia de Dados — Digital College.
