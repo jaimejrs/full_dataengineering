@@ -6,7 +6,7 @@ Fluxo:
     PostgreSQL (fonte) → Redshift (DW) → Parquet/HDFS (Lake) → PostgreSQL (Data Mart)
 
 Estratégia de carga:
-    - Dimensões : FULL (TRUNCATE + INSERT) — tabelas pequenas e estáveis
+    - Dimensões : FULL (TRUNCATE + INSERT)
     - Fato       : INCREMENTAL por data de execução (DELETE dia + INSERT dia)
     - Data Lake  : INCREMENTAL — grava apenas a partição do dia (overwrite=True)
     - Data Mart  : FULL a partir do Redshift, com coluna data_atualizacao
@@ -15,13 +15,19 @@ Estratégia de carga:
 import os
 import logging
 from datetime import datetime, timedelta
+import warnings
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+import psycopg2
+from psycopg2.extras import execute_values
+from urllib.parse import urlparse
 from dotenv import load_dotenv
+
+# Ocultar o UserWarning do Pandas sobre DBAPI2
+warnings.filterwarnings("ignore", category=UserWarning, module="pandas.io.sql")
 
 # ── Configuração ──────────────────────────────────────────────────────────────
 env_paths = [
@@ -38,31 +44,75 @@ for p in env_paths:
 log = logging.getLogger(__name__)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def get_source_engine():
+# ── Helpers Psycopg2 (Bypass SQLAlchemy/Pandas conflict) ─────────────────────
+def get_source_url():
     url = os.environ.get("SOURCE_DATABASE_URL")
     if not url:
-        raise ValueError("Variável SOURCE_DATABASE_URL não encontrada! Verifique se o arquivo .env foi carregado.")
-    return create_engine(url)
+        raise ValueError("Variável SOURCE_DATABASE_URL não encontrada! Verifique o .env")
+    return url
 
-def get_dw_engine():
+def get_dw_url():
     url = os.environ.get("REDSHIFT_DATABASE_URL")
     if not url:
-        raise ValueError("Variável REDSHIFT_DATABASE_URL não encontrada! Verifique se o arquivo .env foi carregado.")
-    
+        raise ValueError("Variável REDSHIFT_DATABASE_URL não encontrada! Verifique o .env")
     if url.startswith("redshift+psycopg2://"):
         url = url.replace("redshift+psycopg2://", "postgresql://")
-        
-    return create_engine(url)
+    return url
 
-def get_dm_engine():
+def get_dm_url():
     url = os.environ.get("DASHBOARD_DATABASE_URL")
     if not url:
-        raise ValueError("Variável DASHBOARD_DATABASE_URL não encontrada! Verifique se o arquivo .env foi carregado.")
-    return create_engine(url)
+        raise ValueError("Variável DASHBOARD_DATABASE_URL não encontrada! Verifique o .env")
+    return url
+
+def _get_pg_conn(url):
+    p = urlparse(url)
+    return psycopg2.connect(
+        dbname=p.path[1:],
+        user=p.username,
+        password=p.password,
+        host=p.hostname,
+        port=p.port
+    )
+
+def execute_query(url, query):
+    """Executa uma query DML/DDL simples."""
+    conn = _get_pg_conn(url)
+    cur = conn.cursor()
+    cur.execute(query)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def read_sql_from_url(query, url):
+    """Lê um DataFrame via DBAPI puro, contornando a Engine do Pandas."""
+    conn = _get_pg_conn(url)
+    df = pd.read_sql(query, conn)
+    conn.close()
+    return df
+
+def _truncate_insert(url_str, df, table, schema="public", chunksize=2000):
+    """TRUNCATE + INSERT bulk via psycopg2."""
+    execute_query(url_str, f"TRUNCATE TABLE {schema}.{table}")
+    append_to_table(url_str, df, table, schema, chunksize)
+
+def append_to_table(url_str, df, table, schema="public", chunksize=2000):
+    """INSERT bulk via psycopg2."""
+    if df.empty: return
+    # Tratar NaNs para NULL no banco
+    df = df.where(pd.notnull(df), None)
+    tuples = [tuple(x) for x in df.to_numpy()]
+    cols = ','.join(list(df.columns))
+    
+    conn = _get_pg_conn(url_str)
+    cur = conn.cursor()
+    query = f"INSERT INTO {schema}.{table} ({cols}) VALUES %s"
+    execute_values(cur, query, tuples, page_size=chunksize)
+    conn.commit()
+    cur.close()
+    conn.close()
 
 def add_sk(df, col_name="sk"):
-    """Adiciona surrogate key sequencial como primeira coluna."""
     df = df.copy().reset_index(drop=True)
     df.insert(0, col_name, range(1, len(df) + 1))
     return df
@@ -72,9 +122,8 @@ def add_sk(df, col_name="sk"):
 # TASK 1 — extrair_banco_fonte
 # ══════════════════════════════════════════════════════════════════════════════
 def extrair_banco_fonte(**context):
-    """Extrai e recarrega todas as dimensões do banco fonte no Redshift."""
-    engine_src = get_source_engine()
-    engine_rs  = get_dw_engine()
+    url_src = get_source_url()
+    url_rs  = get_dw_url()
 
     # ── DIM TEMPO ─────────────────────────────────────────────────────────────
     datas = pd.date_range("2015-01-01", "2026-12-31")
@@ -88,73 +137,69 @@ def extrair_banco_fonte(**context):
         "is_fim_semana": datas.weekday >= 5,
     })
     add_sk(dim_tempo, "sk_tempo").pipe(
-        lambda df: _truncate_insert(engine_rs, df, "dim_tempo")
+        lambda df: _truncate_insert(url_rs, df, "dim_tempo")
     )
     log.info(f"dim_tempo: {len(dim_tempo)} linhas")
 
     # ── DIM PRODUTO ────────────────────────────────────────────────────────────
-    with engine_src.connect() as conn:
-        df_produto = pd.read_sql("""
-            SELECT p.id AS id_produto, p.nome AS nome,
-                   cat.descricao AS categoria, p.valor_venda AS preco_tabela
-            FROM vendas.produto p
-            JOIN vendas.categoria cat ON cat.id = p.id_categoria
-        """, conn)
+    df_produto = read_sql_from_url("""
+        SELECT p.id AS id_produto, p.nome AS nome,
+               cat.descricao AS categoria, p.valor_venda AS preco_tabela
+        FROM vendas.produto p
+        JOIN vendas.categoria cat ON cat.id = p.id_categoria
+    """, url_src)
     add_sk(df_produto, "sk_produto").pipe(
-        lambda df: _truncate_insert(engine_rs, df, "dim_produto")
+        lambda df: _truncate_insert(url_rs, df, "dim_produto")
     )
     log.info(f"dim_produto: {len(df_produto)} linhas")
 
     # ── DIM CLIENTE (PF + PJ) ─────────────────────────────────────────────────
-    with engine_src.connect() as conn:
-        df_cliente = pd.read_sql("""
-            SELECT DISTINCT
-                p.id                                        AS id_pessoa,
-                COALESCE(pf.nome, pj.razao_social)          AS nome,
-                COALESCE(pf.cpf,  pj.cnpj)                  AS documento,
-                CASE WHEN pf.id IS NOT NULL THEN 'PF' ELSE 'PJ' END AS tipo_pessoa
-            FROM geral.pessoa p
-            LEFT JOIN geral.pessoa_fisica   pf ON pf.id = p.id
-            LEFT JOIN geral.pessoa_juridica pj ON pj.id = p.id
-            WHERE p.id IN (SELECT id_cliente FROM vendas.nota_fiscal)
-              AND (pf.id IS NOT NULL OR pj.id IS NOT NULL)
-        """, conn)
+    df_cliente = read_sql_from_url("""
+        SELECT DISTINCT
+            p.id                                        AS id_pessoa,
+            COALESCE(pf.nome, pj.razao_social)          AS nome,
+            COALESCE(pf.cpf,  pj.cnpj)                  AS documento,
+            CASE WHEN pf.id IS NOT NULL THEN 'PF' ELSE 'PJ' END AS tipo_pessoa
+        FROM geral.pessoa p
+        LEFT JOIN geral.pessoa_fisica   pf ON pf.id = p.id
+        LEFT JOIN geral.pessoa_juridica pj ON pj.id = p.id
+        WHERE p.id IN (SELECT id_cliente FROM vendas.nota_fiscal)
+          AND (pf.id IS NOT NULL OR pj.id IS NOT NULL)
+    """, url_src)
     add_sk(df_cliente, "sk_cliente").pipe(
-        lambda df: _truncate_insert(engine_rs, df, "dim_cliente")
+        lambda df: _truncate_insert(url_rs, df, "dim_cliente")
     )
     log.info(f"dim_cliente: {len(df_cliente)} linhas (PF+PJ)")
 
     # ── DIM VENDEDOR ───────────────────────────────────────────────────────────
-    with engine_src.connect() as conn:
-        df_vendedor = pd.read_sql("""
-            SELECT DISTINCT pf.id AS id_pessoa, pf.nome AS nome
-            FROM vendas.nota_fiscal nf
-            JOIN geral.pessoa_fisica pf ON pf.id = nf.id_vendedor
-        """, conn)
+    df_vendedor = read_sql_from_url("""
+        SELECT DISTINCT pf.id AS id_pessoa, pf.nome AS nome
+        FROM vendas.nota_fiscal nf
+        JOIN geral.pessoa_fisica pf ON pf.id = nf.id_vendedor
+    """, url_src)
     add_sk(df_vendedor, "sk_vendedor").pipe(
-        lambda df: _truncate_insert(engine_rs, df, "dim_vendedor")
+        lambda df: _truncate_insert(url_rs, df, "dim_vendedor")
     )
     log.info(f"dim_vendedor: {len(df_vendedor)} linhas")
 
     # ── DIM LOCALIDADE ─────────────────────────────────────────────────────────
-    with engine_src.connect() as conn:
-        df_localidade = pd.read_sql("""
-            SELECT DISTINCT
-                p.id          AS id_pessoa,
-                b.descricao   AS bairro,
-                c.descricao   AS cidade,
-                est.sigla     AS sigla_estado,
-                est.descricao AS estado,
-                e.cep
-            FROM geral.pessoa p
-            LEFT JOIN geral.endereco e   ON e.id_pessoa = p.id
-            LEFT JOIN geral.bairro   b   ON b.id = e.id_bairro
-            LEFT JOIN geral.cidade   c   ON c.id = b.id_cidade
-            LEFT JOIN geral.estado   est ON est.id = c.id_estado
-            WHERE e.id IS NOT NULL
-        """, conn)
+    df_localidade = read_sql_from_url("""
+        SELECT DISTINCT
+            p.id          AS id_pessoa,
+            b.descricao   AS bairro,
+            c.descricao   AS cidade,
+            est.sigla     AS sigla_estado,
+            est.descricao AS estado,
+            e.cep
+        FROM geral.pessoa p
+        LEFT JOIN geral.endereco e   ON e.id_pessoa = p.id
+        LEFT JOIN geral.bairro   b   ON b.id = e.id_bairro
+        LEFT JOIN geral.cidade   c   ON c.id = b.id_cidade
+        LEFT JOIN geral.estado   est ON est.id = c.id_estado
+        WHERE e.id IS NOT NULL
+    """, url_src)
     add_sk(df_localidade, "sk_localidade").pipe(
-        lambda df: _truncate_insert(engine_rs, df, "dim_localidade")
+        lambda df: _truncate_insert(url_rs, df, "dim_localidade")
     )
     log.info(f"dim_localidade: {len(df_localidade)} linhas")
 
@@ -167,41 +212,32 @@ def extrair_banco_fonte(**context):
     })
 
 
-def _truncate_insert(engine, df, table, schema="public", chunksize=2000):
-    """TRUNCATE + INSERT idempotente usando conn."""
-    with engine.begin() as conn:
-        conn.execute(text(f"TRUNCATE TABLE {schema}.{table}"))
-        df.to_sql(table, conn, schema=schema,
-                  if_exists="append", index=False, method="multi", chunksize=chunksize)
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # TASK 2 — carregar_redshift
 # ══════════════════════════════════════════════════════════════════════════════
 def carregar_redshift(**context):
     execution_date = context['ds']
-    engine_src = get_source_engine()
-    engine_rs  = get_dw_engine()
+    url_src = get_source_url()
+    url_rs  = get_dw_url()
 
     log.info(f"Carregando fato para data de execução: {execution_date}")
 
-    with engine_src.connect() as conn:
-        df_raw = pd.read_sql(f"""
-            SELECT
-                nf.data_venda::date  AS data_venda,
-                nf.id_cliente,
-                nf.id_vendedor,
-                inf.id_produto,
-                nf.id                AS id_nota,
-                inf.quantidade,
-                inf.valor_unitario,
-                inf.valor_venda_real,
-                p.valor_venda
-            FROM vendas.nota_fiscal nf
-            JOIN vendas.item_nota_fiscal inf ON inf.id_nota_fiscal = nf.id
-            JOIN vendas.produto p            ON p.id = inf.id_produto
-            WHERE nf.data_venda::date = '{execution_date}'
-        """, conn)
+    df_raw = read_sql_from_url(f"""
+        SELECT
+            nf.data_venda::date  AS data_venda,
+            nf.id_cliente,
+            nf.id_vendedor,
+            inf.id_produto,
+            nf.id                AS id_nota,
+            inf.quantidade,
+            inf.valor_unitario,
+            inf.valor_venda_real,
+            p.valor_venda
+        FROM vendas.nota_fiscal nf
+        JOIN vendas.item_nota_fiscal inf ON inf.id_nota_fiscal = nf.id
+        JOIN vendas.produto p            ON p.id = inf.id_produto
+        WHERE nf.data_venda::date = '{execution_date}'
+    """, url_src)
 
     if df_raw.empty:
         log.info(f"Nenhuma venda encontrada para {execution_date}. Encerrando task.")
@@ -211,16 +247,14 @@ def carregar_redshift(**context):
     df_fato = df_raw.copy()
     df_fato["data_venda"] = pd.to_datetime(df_fato["data_venda"]).dt.date
 
-    with engine_rs.connect() as conn:
-        dim_tempo      = pd.read_sql("SELECT sk_tempo, data FROM public.dim_tempo", conn)
-        dim_produto    = pd.read_sql("SELECT sk_produto, id_produto FROM public.dim_produto", conn)
-        dim_cliente    = pd.read_sql("SELECT sk_cliente, id_pessoa FROM public.dim_cliente", conn)
-        dim_vendedor   = pd.read_sql("SELECT sk_vendedor, id_pessoa FROM public.dim_vendedor", conn)
-        dim_localidade = pd.read_sql("SELECT sk_localidade, id_pessoa FROM public.dim_localidade", conn)
+    dim_tempo      = read_sql_from_url("SELECT sk_tempo, data FROM public.dim_tempo", url_rs)
+    dim_produto    = read_sql_from_url("SELECT sk_produto, id_produto FROM public.dim_produto", url_rs)
+    dim_cliente    = read_sql_from_url("SELECT sk_cliente, id_pessoa FROM public.dim_cliente", url_rs)
+    dim_vendedor   = read_sql_from_url("SELECT sk_vendedor, id_pessoa FROM public.dim_vendedor", url_rs)
+    dim_localidade = read_sql_from_url("SELECT sk_localidade, id_pessoa FROM public.dim_localidade", url_rs)
 
     dim_tempo["data"] = pd.to_datetime(dim_tempo["data"]).dt.date
 
-    # Merges
     df_fato = (df_fato
         .merge(dim_tempo.rename(columns={"data": "data_venda"}), on="data_venda", how="left")
         .merge(dim_produto, on="id_produto", how="left")
@@ -237,16 +271,18 @@ def carregar_redshift(**context):
             "desconto", "pct_desconto"]
     df_fato = df_fato[cols]
 
-    with engine_rs.begin() as conn:
-        conn.execute(text(f"""
-            DELETE FROM public.fato_venda
-            WHERE sk_tempo IN (
-                SELECT sk_tempo FROM public.dim_tempo
-                WHERE data = '{execution_date}'
-            )
-        """))
-        df_fato.to_sql("fato_venda", conn, schema="public",
-                       if_exists="append", index=False, method="multi", chunksize=5000)
+    nulos = df_fato[["sk_cliente", "sk_localidade"]].isnull().sum()
+    log.info(f"Nulos nas SKs:\n{nulos}")
+
+    # DELETE do dia + INSERT (idempotente)
+    execute_query(url_rs, f"""
+        DELETE FROM public.fato_venda
+        WHERE sk_tempo IN (
+            SELECT sk_tempo FROM public.dim_tempo
+            WHERE data = '{execution_date}'
+        )
+    """)
+    append_to_table(url_rs, df_fato, "fato_venda", schema="public", chunksize=5000)
 
     log.info(f"fato_venda [{execution_date}]: {len(df_fato)} linhas inseridas")
     context['ti'].xcom_push(key='fato_count', value=len(df_fato))
@@ -263,18 +299,17 @@ def gravar_data_lake(**context):
     exec_dt = datetime.strptime(execution_date, "%Y-%m-%d")
     ano, mes = exec_dt.year, exec_dt.month
 
-    engine_rs = get_dw_engine()
+    url_rs = get_dw_url()
 
-    with engine_rs.connect() as conn:
-        df = pd.read_sql(f"""
-            SELECT dt.ano, dt.mes, dt.data,
-                   fv.quantidade, fv.valor_unitario, fv.valor_venda_real,
-                   dl.sigla_estado, dl.cidade
-            FROM public.fato_venda fv
-            JOIN public.dim_tempo dt ON dt.sk_tempo = fv.sk_tempo
-            LEFT JOIN public.dim_localidade dl ON dl.sk_localidade = fv.sk_localidade
-            WHERE dt.ano = {ano} AND dt.mes = {mes}
-        """, conn)
+    df = read_sql_from_url(f"""
+        SELECT dt.ano, dt.mes, dt.data,
+               fv.quantidade, fv.valor_unitario, fv.valor_venda_real,
+               dl.sigla_estado, dl.cidade
+        FROM public.fato_venda fv
+        JOIN public.dim_tempo dt ON dt.sk_tempo = fv.sk_tempo
+        LEFT JOIN public.dim_localidade dl ON dl.sk_localidade = fv.sk_localidade
+        WHERE dt.ano = {ano} AND dt.mes = {mes}
+    """, url_rs)
 
     if df.empty:
         log.info("Nenhum dado para gravar no lake.")
@@ -317,16 +352,15 @@ def gravar_data_lake(**context):
 # TASK 4 — popular_data_mart
 # ══════════════════════════════════════════════════════════════════════════════
 def popular_data_mart(**context):
-    engine_rs = get_dw_engine()
-    engine_dm = get_dm_engine()
-    agora     = pd.Timestamp.now().floor("s")
+    url_rs = get_dw_url()
+    url_dm = get_dm_url()
+    agora  = pd.Timestamp.now().floor("s")
 
-    with engine_rs.connect() as conn:
-        df_fato = pd.read_sql("""
-            SELECT dt.ano, dt.mes, fv.quantidade, fv.valor_unitario, fv.valor_venda_real
-            FROM public.fato_venda fv
-            JOIN public.dim_tempo dt ON dt.sk_tempo = fv.sk_tempo
-        """, conn)
+    df_fato = read_sql_from_url("""
+        SELECT dt.ano, dt.mes, fv.quantidade, fv.valor_unitario, fv.valor_venda_real
+        FROM public.fato_venda fv
+        JOIN public.dim_tempo dt ON dt.sk_tempo = fv.sk_tempo
+    """, url_rs)
 
     vam = (
         df_fato.groupby(["ano", "mes"], as_index=False)
@@ -339,32 +373,28 @@ def popular_data_mart(**context):
     vam["valor_total_esperado"]  = vam["valor_total_esperado"].round(2)
     vam["data_atualizacao"]      = agora
 
-    with engine_dm.begin() as conn:
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS public.vendas_ano_mes_jaime (
-                id                   SERIAL PRIMARY KEY,
-                ano                  INTEGER,
-                mes                  INTEGER,
-                qtde_vendida         INTEGER,
-                valor_total_real     NUMERIC(18,2),
-                valor_total_esperado NUMERIC(18,2),
-                data_atualizacao     TIMESTAMP
-            )
-        """))
-        conn.execute(text("TRUNCATE TABLE public.vendas_ano_mes_jaime"))
-        vam.to_sql("vendas_ano_mes_jaime", conn, schema="public",
-                   if_exists="append", index=False, method="multi", chunksize=1000)
+    execute_query(url_dm, """
+        CREATE TABLE IF NOT EXISTS public.vendas_ano_mes_jaime (
+            id                   SERIAL PRIMARY KEY,
+            ano                  INTEGER,
+            mes                  INTEGER,
+            qtde_vendida         INTEGER,
+            valor_total_real     NUMERIC(18,2),
+            valor_total_esperado NUMERIC(18,2),
+            data_atualizacao     TIMESTAMP
+        )
+    """)
+    _truncate_insert(url_dm, vam, "vendas_ano_mes_jaime", schema="public", chunksize=1000)
     log.info(f"vendas_ano_mes_jaime: {len(vam)} linhas | atualizado em {agora}")
 
-    with engine_rs.connect() as conn:
-        df_loc = pd.read_sql("""
-            SELECT dt.ano, dl.sigla_estado, dl.estado, dl.cidade,
-                   fv.quantidade, fv.valor_unitario, fv.valor_venda_real
-            FROM public.fato_venda fv
-            JOIN public.dim_tempo dt            ON dt.sk_tempo = fv.sk_tempo
-            LEFT JOIN public.dim_localidade dl  ON dl.sk_localidade = fv.sk_localidade
-            WHERE dl.sk_localidade IS NOT NULL
-        """, conn)
+    df_loc = read_sql_from_url("""
+        SELECT dt.ano, dl.sigla_estado, dl.estado, dl.cidade,
+               fv.quantidade, fv.valor_unitario, fv.valor_venda_real
+        FROM public.fato_venda fv
+        JOIN public.dim_tempo dt            ON dt.sk_tempo = fv.sk_tempo
+        LEFT JOIN public.dim_localidade dl  ON dl.sk_localidade = fv.sk_localidade
+        WHERE dl.sk_localidade IS NOT NULL
+    """, url_rs)
 
     vloc = (
         df_loc.groupby(["ano", "sigla_estado", "estado", "cidade"], as_index=False)
@@ -380,24 +410,21 @@ def popular_data_mart(**context):
     ).round(2)
     vloc["data_atualizacao"]     = agora
 
-    with engine_dm.begin() as conn:
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS public.vendas_localidade_jaime (
-                id                   SERIAL PRIMARY KEY,
-                ano                  INTEGER,
-                sigla_estado         VARCHAR(2),
-                estado               VARCHAR(100),
-                cidade               VARCHAR(200),
-                qtde_vendida         INTEGER,
-                valor_total_real     NUMERIC(18,2),
-                valor_total_esperado NUMERIC(18,2),
-                pct_atingimento      NUMERIC(8,2),
-                data_atualizacao     TIMESTAMP
-            )
-        """))
-        conn.execute(text("TRUNCATE TABLE public.vendas_localidade_jaime"))
-        vloc.to_sql("vendas_localidade_jaime", conn, schema="public",
-                    if_exists="append", index=False, method="multi", chunksize=1000)
+    execute_query(url_dm, """
+        CREATE TABLE IF NOT EXISTS public.vendas_localidade_jaime (
+            id                   SERIAL PRIMARY KEY,
+            ano                  INTEGER,
+            sigla_estado         VARCHAR(2),
+            estado               VARCHAR(100),
+            cidade               VARCHAR(200),
+            qtde_vendida         INTEGER,
+            valor_total_real     NUMERIC(18,2),
+            valor_total_esperado NUMERIC(18,2),
+            pct_atingimento      NUMERIC(8,2),
+            data_atualizacao     TIMESTAMP
+        )
+    """)
+    _truncate_insert(url_dm, vloc, "vendas_localidade_jaime", schema="public", chunksize=1000)
     log.info(f"vendas_localidade_jaime: {len(vloc)} linhas | atualizado em {agora}")
 
     context['ti'].xcom_push(key='mart_counts', value={
