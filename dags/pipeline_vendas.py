@@ -158,7 +158,8 @@ def extrair_banco_fonte(**context):
         SELECT DISTINCT
             p.id                                        AS id_pessoa,
             COALESCE(pf.nome, pj.razao_social)          AS nome,
-            COALESCE(pf.cpf,  pj.cnpj)                  AS cpf
+            COALESCE(pf.cpf,  pj.cnpj)                  AS documento,
+            CASE WHEN pf.id IS NOT NULL THEN 'PF' ELSE 'PJ' END AS tipo_pessoa
         FROM geral.pessoa p
         LEFT JOIN geral.pessoa_fisica   pf ON pf.id = p.id
         LEFT JOIN geral.pessoa_juridica pj ON pj.id = p.id

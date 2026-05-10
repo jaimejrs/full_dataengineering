@@ -26,7 +26,8 @@ CREATE TABLE dim_cliente (
     sk_cliente  INTEGER PRIMARY KEY,
     id_pessoa   INTEGER,
     nome        VARCHAR(200),
-    cpf         VARCHAR(14)
+    documento   VARCHAR(20),
+    tipo_pessoa VARCHAR(2)
 )
 DISTKEY(sk_cliente);
 
