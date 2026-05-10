@@ -49,6 +49,12 @@ def get_dw_engine():
     url = os.environ.get("REDSHIFT_DATABASE_URL")
     if not url:
         raise ValueError("Variável REDSHIFT_DATABASE_URL não encontrada! Verifique se o arquivo .env foi carregado.")
+    
+    # Airflow muitas vezes não tem o plugin 'sqlalchemy-redshift' instalado por padrão.
+    # Como o Redshift é baseado no PostgreSQL, podemos usar o driver nativo como fallback.
+    if url.startswith("redshift+psycopg2://"):
+        url = url.replace("redshift+psycopg2://", "postgresql://")
+        
     return create_engine(url)
 
 def get_dm_engine():
