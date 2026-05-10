@@ -25,8 +25,9 @@ from dotenv import load_dotenv
 
 # ── Configuração ──────────────────────────────────────────────────────────────
 env_paths = [
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env'),
-    '/home/jota/digital_college/projeto_python14/projeto/.env'
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'),        # Na própria pasta dags/
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env'), # Na pasta pai
+    '/home/jota/digital_college/projeto_python14/projeto/.env'              # Fallback hardcoded
 ]
 
 for p in env_paths:
